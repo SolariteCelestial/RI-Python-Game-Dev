@@ -1,410 +1,790 @@
 import os
 import sys
-import pygame
 import math
 import random
+from collections import deque
 
-# ── Headless / Codespaces environment fixes ───────────────────────────────────
-if not os.environ.get("DISPLAY"):
-    os.environ["DISPLAY"] = ":99"
-if not os.environ.get("XDG_RUNTIME_DIR"):
-    os.environ["XDG_RUNTIME_DIR"] = "/tmp/runtime-vscode"
-    os.makedirs("/tmp/runtime-vscode", exist_ok=True)
-os.environ["SDL_AUDIODRIVER"] = "dummy"
+import pygame
+
+# ── Headless / Codespaces environment fixes (same as game.py) ────────────────
+if sys.platform.startswith("linux"):
+    if not os.environ.get("DISPLAY"):
+        os.environ["DISPLAY"] = ":99"
+    if not os.environ.get("XDG_RUNTIME_DIR"):
+        os.environ["XDG_RUNTIME_DIR"] = "/tmp/runtime-vscode"
+        os.makedirs("/tmp/runtime-vscode", exist_ok=True)
+os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
 # ─────────────────────────────────────────
-#  INITIALISE pygame
+# INITIALISE pygame
 # ─────────────────────────────────────────
 pygame.init()
 
-SCREEN_WIDTH  = 640
-SCREEN_HEIGHT = 480
-TITLE         = "Top-Down Cube Knight"
+SCREEN_WIDTH = 640
+SCREEN_HEIGHT = 640
+TITLE = "Cube Knight: Card Maze"
+
 screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
 pygame.display.set_caption(TITLE)
 clock = pygame.time.Clock()
 FPS = 60
 
+FONT_S = pygame.font.Font(None, 20)
+FONT_M = pygame.font.Font(None, 26)
+FONT_L = pygame.font.Font(None, 64)
+FONT_XL = pygame.font.Font(None, 48)
+
 # ─────────────────────────────────────────
-#  COLOURS
+# COLOURS (original palette + a few extras)
 # ─────────────────────────────────────────
-BLACK  = ( 15,  15,  20)
-WHITE  = (240, 240, 240)
-GRAY   = ( 40,  40,  40)
-RED    = (220,  50,  50)
-ORANGE = (255, 150,  50)
-CYAN   = (150, 255, 255)
+BLACK = (15, 15, 20)
+WHITE = (240, 240, 240)
+GRAY = (40, 40, 40)
+RED = (220, 50, 50)
+ORANGE = (255, 150, 50)
+CYAN = (150, 255, 255)
 YELLOW = (255, 255, 100)
+GREEN = (90, 210, 120)
+BLUE = (90, 140, 255)
+PURPLE = (200, 90, 230)
+DARKRED = (150, 30, 40)
+WALL = (58, 58, 72)
+FLOOR = (20, 20, 27)
+PANEL = (28, 28, 36)
 
 # ─────────────────────────────────────────
-#  CONSTANTS
+# CONSTANTS
 # ─────────────────────────────────────────
-PLAYER_SPEED = 5
-FRICTION = 0.8
-ENEMY_SPEED = 2
-MAX_ENEMIES = 6
+TILE = 32
+COLS, ROWS = 19, 13                      # must both be odd
+MAZE_X = (SCREEN_WIDTH - COLS * TILE) // 2
+MAZE_Y = 40
+MAZE_RECT = pygame.Rect(MAZE_X, MAZE_Y, COLS * TILE, ROWS * TILE)
+
+HAND_SIZE = 5
+START_HP = 10
+ATTACK_DMG = 2
+CARD_W, CARD_H, CARD_Y = 112, 124, 496
+
+DIRS = {"UP": (0, -1), "DOWN": (0, 1), "LEFT": (-1, 0), "RIGHT": (1, 0)}
+KEY_DIR = {
+    pygame.K_UP: "UP", pygame.K_w: "UP",
+    pygame.K_DOWN: "DOWN", pygame.K_s: "DOWN",
+    pygame.K_LEFT: "LEFT", pygame.K_a: "LEFT",
+    pygame.K_RIGHT: "RIGHT", pygame.K_d: "RIGHT",
+}
+
+ALL_CARDS = [(k, n) for k in ("move", "attack") for n in range(1, 6)]
+START_DECK = [("move", 1), ("move", 1), ("move", 2), ("move", 2), ("move", 3), ("move", 4),
+              ("attack", 1), ("attack", 1), ("attack", 2), ("attack", 2), ("attack", 3), ("attack", 4)]
+
+# Enemy roster. A new type unlocks each round, in this order.
+ENEMY_TYPES = {
+    "walker": dict(name="Walker", hp=2, color=RED,     glyph="W", inset=3),
+    "bat":    dict(name="Bat",    hp=2, color=PURPLE,  glyph="B", inset=7),
+    "archer": dict(name="Archer", hp=2, color=GREEN,   glyph="A", inset=3),
+    "rook":   dict(name="Rook",   hp=3, color=BLUE,    glyph="R", inset=3),
+    "brute":  dict(name="Brute",  hp=5, color=DARKRED, glyph="H", inset=1),
+}
+UNLOCK_ORDER = ["walker", "bat", "archer", "rook", "brute"]
+
 
 # ─────────────────────────────────────────
-#  CLASSES
+# MAZE GENERATION (recursive backtracker + a few loops)
 # ─────────────────────────────────────────
-class Player:
-    def __init__(self, x, y):
-        self.rect = pygame.Rect(x, y, 30, 30)
-        self.vel_x = 0
-        self.vel_y = 0
-        self.facing = 'RIGHT' # 'UP', 'DOWN', 'LEFT', 'RIGHT'
-        
-        # Combat
-        self.hp = 5
-        self.invuln_timer = 0
-        self.attack_timer = 0
-        self.attack_cooldown = 0
-        self.attack_rect = None
-        self.recoil_timer = 0
-
-    def update(self, keys):
-        # 1. Handle Movement (Input vs Recoil)
-        if self.recoil_timer > 0:
-            self.recoil_timer -= 1
-            self.vel_x *= FRICTION
-            self.vel_y *= FRICTION
+def make_maze():
+    g = [[1] * COLS for _ in range(ROWS)]
+    g[1][1] = 0
+    stack = [(1, 1)]
+    while stack:
+        x, y = stack[-1]
+        opts = []
+        for dx, dy in ((2, 0), (-2, 0), (0, 2), (0, -2)):
+            nx, ny = x + dx, y + dy
+            if 1 <= nx < COLS - 1 and 1 <= ny < ROWS - 1 and g[ny][nx] == 1:
+                opts.append((nx, ny, dx, dy))
+        if opts:
+            nx, ny, dx, dy = random.choice(opts)
+            g[y + dy // 2][x + dx // 2] = 0
+            g[ny][nx] = 0
+            stack.append((nx, ny))
         else:
-            self.vel_x = 0
-            self.vel_y = 0
-            
-            # 4-Way Movement
-            if keys[pygame.K_LEFT]:
-                self.vel_x = -PLAYER_SPEED
-                self.facing = 'LEFT'
-            elif keys[pygame.K_RIGHT]:
-                self.vel_x = PLAYER_SPEED
-                self.facing = 'RIGHT'
-            if keys[pygame.K_UP]:
-                self.vel_y = -PLAYER_SPEED
-                self.facing = 'UP'
-            elif keys[pygame.K_DOWN]:
-                self.vel_y = PLAYER_SPEED
-                self.facing = 'DOWN'
-
-        self.rect.x += self.vel_x
-        self.rect.y += self.vel_y
-
-        # Screen bounds
-        self.rect.clamp_ip(screen.get_rect())
-
-        # 2. Attack Timers & Hitbox positioning
-        if self.attack_cooldown > 0:
-            self.attack_cooldown -= 1
-            
-        if self.attack_timer > 0:
-            self.attack_timer -= 1
-            # Position hitbox based on facing direction
-            if self.facing == 'RIGHT':
-                self.attack_rect = pygame.Rect(self.rect.right, self.rect.y - 15, 45, 60)
-            elif self.facing == 'LEFT':
-                self.attack_rect = pygame.Rect(self.rect.left - 45, self.rect.y - 15, 45, 60)
-            elif self.facing == 'UP':
-                self.attack_rect = pygame.Rect(self.rect.x - 15, self.rect.top - 45, 60, 45)
-            elif self.facing == 'DOWN':
-                self.attack_rect = pygame.Rect(self.rect.x - 15, self.rect.bottom, 60, 45)
-        else:
-            self.attack_rect = None
-
-        if self.invuln_timer > 0:
-            self.invuln_timer -= 1
-
-    def attack(self):
-        if self.attack_cooldown == 0 and self.attack_timer == 0:
-            self.attack_timer = 10     
-            self.attack_cooldown = 20  
-
-    def take_damage(self, amount, knock_dx, knock_dy):
-        if self.invuln_timer == 0:
-            self.hp -= amount
-            self.invuln_timer = 60 # 1 second of i-frames
-            self.vel_x = knock_dx * 8
-            self.vel_y = knock_dy * 8
-            self.recoil_timer = 15
-
-    def draw(self, surface):
-        if self.invuln_timer > 0 and (self.invuln_timer // 4) % 2 == 0:
-            return # Flicker
-
-        pygame.draw.rect(surface, WHITE, self.rect)
-        
-        # Draw Eye to show direction
-        eye_x, eye_y = self.rect.centerx, self.rect.centery
-        if self.facing == 'RIGHT': eye_x += 8
-        elif self.facing == 'LEFT': eye_x -= 12
-        elif self.facing == 'UP': eye_y -= 12
-        elif self.facing == 'DOWN': eye_y += 8
-        pygame.draw.rect(surface, BLACK, (eye_x, eye_y, 4, 4))
-
-        # Draw Slash Hitbox
-        if self.attack_rect:
-            pygame.draw.rect(surface, CYAN, self.attack_rect, 2)
+            stack.pop()
+    # Knock out a few wall segments so the maze has loops (less dead-endy)
+    for y in range(1, ROWS - 1):
+        for x in range(1, COLS - 1):
+            if g[y][x] == 1 and (x + y) % 2 == 1 and random.random() < 0.12:
+                if (g[y][x - 1] == 0 and g[y][x + 1] == 0) or (g[y - 1][x] == 0 and g[y + 1][x] == 0):
+                    g[y][x] = 0
+    return g
 
 
+def pick_kinds(rnd):
+    """Round N spawns N enemies. The newest type is guaranteed to show up."""
+    pool = UNLOCK_ORDER[:min(rnd, len(UNLOCK_ORDER))]
+    kinds = []
+    if 1 < rnd <= len(UNLOCK_ORDER):
+        kinds.append(UNLOCK_ORDER[rnd - 1])
+    while len(kinds) < rnd:
+        kinds.append(random.choice(pool))
+    return kinds
+
+
+# ─────────────────────────────────────────
+# CLASSES
+# ─────────────────────────────────────────
 class Enemy:
-    def __init__(self, x, y):
-        self.rect = pygame.Rect(x, y, 30, 30)
-        self.hp = 3
-        self.vel_x = 0
-        self.vel_y = 0
-        self.facing = 'DOWN'
-        
-        self.state = "chase" # chase, windup, attack, cooldown, stunned
-        self.state_timer = 0
-        self.attack_rect = None
+    def __init__(self, kind, x, y):
+        t = ENEMY_TYPES[kind]
+        self.kind = kind
+        self.x, self.y = x, y
+        self.hp = self.max_hp = t["hp"]
+        self.windup = None      # Brute: tile it is about to slam
+        self.tick = 0
 
-    def update(self, player):
-        if self.state == "chase":
-            # Move towards player
-            dx = player.rect.centerx - self.rect.centerx
-            dy = player.rect.centery - self.rect.centery
-            dist = math.hypot(dx, dy)
-            
-            if dist > 0:
-                self.vel_x = (dx / dist) * ENEMY_SPEED
-                self.vel_y = (dy / dist) * ENEMY_SPEED
-            
-            self.rect.x += self.vel_x
-            self.rect.y += self.vel_y
-
-            # Determine facing for attack based on largest delta
-            if abs(dx) > abs(dy):
-                self.facing = 'RIGHT' if dx > 0 else 'LEFT'
-            else:
-                self.facing = 'DOWN' if dy > 0 else 'UP'
-
-            # Attack trigger range
-            if dist < 65:
-                self.state = "windup"
-                self.state_timer = 25 # Windup frames
-
-        elif self.state == "windup":
-            self.state_timer -= 1
-            if self.state_timer <= 0:
-                self.state = "attack"
-                self.state_timer = 15 
-
-        elif self.state == "attack":
-            self.state_timer -= 1
-            
-            # Spawn hitbox based on facing
-            if self.facing == 'RIGHT':
-                self.attack_rect = pygame.Rect(self.rect.right, self.rect.y - 5, 30, 40)
-            elif self.facing == 'LEFT':
-                self.attack_rect = pygame.Rect(self.rect.left - 30, self.rect.y - 5, 30, 40)
-            elif self.facing == 'UP':
-                self.attack_rect = pygame.Rect(self.rect.x - 5, self.rect.top - 30, 40, 30)
-            elif self.facing == 'DOWN':
-                self.attack_rect = pygame.Rect(self.rect.x - 5, self.rect.bottom, 40, 30)
-                
-            if self.state_timer <= 0:
-                self.attack_rect = None
-                self.state = "cooldown"
-                self.state_timer = 40 
-
-        elif self.state == "cooldown":
-            self.state_timer -= 1
-            if self.state_timer <= 0:
-                self.state = "chase"
-
-        elif self.state == "stunned":
-            # Knockback friction
-            self.rect.x += self.vel_x
-            self.rect.y += self.vel_y
-            self.vel_x *= FRICTION
-            self.vel_y *= FRICTION
-            
-            self.state_timer -= 1
-            if self.state_timer <= 0:
-                self.state = "chase"
-
-    def draw(self, surface):
-        color = RED
-        if self.state == "windup": color = ORANGE
-        elif self.state == "stunned": color = GRAY
-        
-        pygame.draw.rect(surface, color, self.rect)
-        
-        # Enemy Attack hitbox
-        if self.attack_rect:
-            pygame.draw.rect(surface, RED, self.attack_rect)
 
 class Spark:
     def __init__(self, x, y):
         self.x, self.y = x, y
-        self.radius = 10
+        self.radius = 6
         self.life = 10
 
     def update(self):
-        self.radius += 3
+        self.radius += 2
         self.life -= 1
 
     def draw(self, surface):
         if self.life > 0:
             pygame.draw.circle(surface, YELLOW, (int(self.x), int(self.y)), int(self.radius), 2)
 
-def draw_grid(surface):
-    for x in range(0, SCREEN_WIDTH, 40):
-        pygame.draw.line(surface, GRAY, (x, 0), (x, SCREEN_HEIGHT))
-    for y in range(0, SCREEN_HEIGHT, 40):
-        pygame.draw.line(surface, GRAY, (0, y), (SCREEN_WIDTH, y))
+
+def draw_text(surf, text, font, color, center=None, topleft=None):
+    img = font.render(text, True, color)
+    r = img.get_rect()
+    if center:
+        r.center = center
+    elif topleft:
+        r.topleft = topleft
+    surf.blit(img, r)
+
+
+def sign(v):
+    return (v > 0) - (v < 0)
+
 
 # ─────────────────────────────────────────
-#  GAME SETUP
+# GAME
 # ─────────────────────────────────────────
-player = Player(SCREEN_WIDTH//2, SCREEN_HEIGHT//2)
-enemies = []
-sparks = []
+class Game:
+    def __init__(self):
+        self.show_help = True
+        self.reset()
 
-spawn_timer = 0
-SPAWN_RATE = 120 # Spawn an enemy every 2 seconds (60 frames * 2)
+    # ---------- setup ----------
+    def reset(self):
+        self.max_hp = START_HP
+        self.hp = START_HP
+        self.deck = list(START_DECK)
+        self.round = 1
+        self.state = "play"          # play / reward / dead
+        self.start_round()
+        self.say("Pick a card, then a direction.")
 
-screen_shake = 0
-flash_frames = 0
+    def start_round(self):
+        self.grid = make_maze()
+        floors = [(x, y) for y in range(ROWS) for x in range(COLS) if self.grid[y][x] == 0]
+        self.px, self.py = random.choice(floors)
+        self.facing = "RIGHT"
 
-# ─────────────────────────────────────────
-#  GAME LOOP
-# ─────────────────────────────────────────
-running = True
-while running:
+        dist = self.bfs((self.px, self.py))
+        kinds = pick_kinds(self.round)
+        far = [p for p, d in dist.items() if d >= 8]
+        if len(far) < len(kinds):
+            far = [p for p, d in dist.items() if d >= 4]
+        if len(far) < len(kinds):
+            far = [p for p in dist if p != (self.px, self.py)]
+        random.shuffle(far)
+        kinds = kinds[:len(far)]
+        self.enemies = [Enemy(k, *far[i]) for i, k in enumerate(kinds)]
 
-    # ── EVENT HANDLING ───────────────────
-    for event in pygame.event.get():
-        if event.type == pygame.QUIT:
-            running = False
-        if event.type == pygame.KEYDOWN:
-            if event.key == pygame.K_ESCAPE:
-                running = False
-            if event.key == pygame.K_x or event.key == pygame.K_SPACE:
-                player.attack()
+        self.draw_pile = self.deck[:]
+        random.shuffle(self.draw_pile)
+        self.discard = []
+        self.hand = []
+        for _ in range(HAND_SIZE):
+            self.draw_card()
 
-    keys = pygame.key.get_pressed()
+        self.selected = None
+        self.phase = "player"        # player / enemy / clear
+        self.timer = 0
+        self.beams, self.sparks, self.floats, self.flashes = [], [], [], []
+        self.shake = 0
+        self.hit_timer = 0
+        self.log = []
+        self.options = []
+        self.say(f"Round {self.round} - kill {len(self.enemies)}!")
 
-    # ── UPDATE ───────────────────────────
-    player.update(keys)
-    
-    # Spawner Logic
-    spawn_timer -= 1
-    if spawn_timer <= 0 and len(enemies) < MAX_ENEMIES:
-        spawn_timer = SPAWN_RATE
-        # Spawn randomly at screen edges
-        edge = random.choice(['top', 'bottom', 'left', 'right'])
-        if edge == 'top': ex, ey = random.randint(0, SCREEN_WIDTH), -30
-        elif edge == 'bottom': ex, ey = random.randint(0, SCREEN_WIDTH), SCREEN_HEIGHT + 30
-        elif edge == 'left': ex, ey = -30, random.randint(0, SCREEN_HEIGHT)
-        else: ex, ey = SCREEN_WIDTH + 30, random.randint(0, SCREEN_HEIGHT)
-        enemies.append(Enemy(ex, ey))
+    def draw_card(self):
+        if not self.draw_pile:
+            self.draw_pile = self.discard
+            self.discard = []
+            random.shuffle(self.draw_pile)
+        if self.draw_pile:
+            self.hand.append(self.draw_pile.pop())
 
-    for enemy in enemies[:]:
-        enemy.update(player)
-        
-        # --- COMBAT LOGIC ---
-        
-        # 1. PARRY: Both attacks hit each other
-        if player.attack_rect and enemy.attack_rect:
-            if player.attack_rect.colliderect(enemy.attack_rect):
-                enemy.state = "stunned"
-                enemy.state_timer = 45
-                enemy.attack_rect = None
-                
-                # Calculate knockback direction based on positions
-                dx = enemy.rect.centerx - player.rect.centerx
-                dy = enemy.rect.centery - player.rect.centery
-                dist = math.hypot(dx, dy)
-                if dist != 0:
-                    enemy.vel_x = (dx / dist) * 8
-                    enemy.vel_y = (dy / dist) * 8
-                    player.vel_x = -(dx / dist) * 6
-                    player.vel_y = -(dy / dist) * 6
-                
-                player.recoil_timer = 10
-                sparks.append(Spark(player.attack_rect.centerx, player.attack_rect.centery))
-                screen_shake = 10
-                flash_frames = 2
-                
-                player.attack_rect = None 
-                continue 
+    # ---------- helpers ----------
+    def say(self, text):
+        self.msg = text
+        self.pmsg = text
 
-        # 2. Player hits Enemy Body
-        if player.attack_rect and player.attack_rect.colliderect(enemy.rect):
-            if enemy.state != "stunned":
-                enemy.hp -= 1
-                if enemy.hp <= 0:
-                    enemies.remove(enemy)
+    def is_wall(self, x, y):
+        return not (0 <= x < COLS and 0 <= y < ROWS) or self.grid[y][x] == 1
+
+    def enemy_at(self, x, y):
+        for e in self.enemies:
+            if e.x == x and e.y == y:
+                return e
+        return None
+
+    def free(self, x, y):
+        return (not self.is_wall(x, y) and not self.enemy_at(x, y)
+                and (x, y) != (self.px, self.py))
+
+    def bfs(self, start):
+        d = {start: 0}
+        q = deque([start])
+        while q:
+            x, y = q.popleft()
+            for dx, dy in DIRS.values():
+                n = (x + dx, y + dy)
+                if n not in d and not self.is_wall(*n):
+                    d[n] = d[(x, y)] + 1
+                    q.append(n)
+        return d
+
+    def center(self, x, y):
+        return (MAZE_X + x * TILE + TILE // 2, MAZE_Y + y * TILE + TILE // 2)
+
+    def beam(self, a, b, color, life=10, width=3):
+        self.beams.append(dict(a=self.center(*a), b=self.center(*b), color=color, life=life, width=width))
+
+    def spark(self, x, y):
+        self.sparks.append(Spark(*self.center(x, y)))
+
+    def ftext(self, x, y, text, color):
+        cx, cy = self.center(x, y)
+        self.floats.append(dict(x=cx, y=cy - 10, text=text, color=color, life=40))
+
+    def line_clear(self, ax, ay, bx, by):
+        dx, dy = sign(bx - ax), sign(by - ay)
+        x, y = ax + dx, ay + dy
+        while (x, y) != (bx, by):
+            if self.is_wall(x, y) or self.enemy_at(x, y):
+                return False
+            x += dx
+            y += dy
+        return True
+
+    def adjacent(self, e):
+        return abs(e.x - self.px) + abs(e.y - self.py) == 1
+
+    def ray(self, d, n, kind):
+        """Tiles a card of distance n would cover in direction d."""
+        dx, dy = DIRS[d]
+        tiles, target = [], None
+        x, y = self.px, self.py
+        for _ in range(n):
+            x += dx
+            y += dy
+            if self.is_wall(x, y):
+                break
+            e = self.enemy_at(x, y)
+            if e:
+                if kind == "attack":
+                    tiles.append((x, y))
+                    target = e
+                break
+            tiles.append((x, y))
+        return tiles, target
+
+    # ---------- player turn ----------
+    def play(self, d):
+        kind, n = self.hand[self.selected]
+        tiles, target = self.ray(d, n, kind)
+        self.facing = d
+        if kind == "move":
+            if not tiles:
+                self.say("Blocked!")
+                return
+            old = (self.px, self.py)
+            self.px, self.py = tiles[-1]
+            self.beam(old, (self.px, self.py), (110, 110, 130), 8)
+            self.say(f"Moved {len(tiles)}.")
+        else:
+            end = tiles[-1] if tiles else (self.px, self.py)
+            self.beam((self.px, self.py), end, CYAN, 10, 4)
+            if target:
+                target.hp -= ATTACK_DMG
+                self.spark(target.x, target.y)
+                self.ftext(target.x, target.y, f"-{ATTACK_DMG}", YELLOW)
+                name = ENEMY_TYPES[target.kind]["name"]
+                if target.hp <= 0:
+                    self.enemies.remove(target)
+                    self.say(f"Killed the {name}!")
                 else:
-                    enemy.state = "stunned"
-                    enemy.state_timer = 20
-                    
-                    # Knockback
-                    dx = enemy.rect.centerx - player.rect.centerx
-                    dy = enemy.rect.centery - player.rect.centery
-                    dist = math.hypot(dx, dy)
-                    if dist != 0:
-                        enemy.vel_x = (dx / dist) * 6
-                        enemy.vel_y = (dy / dist) * 6
-                        player.vel_x = -(dx / dist) * 3
-                        player.vel_y = -(dy / dist) * 3
-                        
-                    player.recoil_timer = 8
-                    sparks.append(Spark(enemy.rect.centerx, enemy.rect.centery))
-
-        # 3. Enemy Sword hits Player Body
-        if enemy.attack_rect and enemy.attack_rect.colliderect(player.rect):
-            dx = player.rect.centerx - enemy.rect.centerx
-            dy = player.rect.centery - enemy.rect.centery
-            dist = math.hypot(dx, dy)
-            if dist != 0:
-                player.take_damage(1, dx/dist, dy/dist)
+                    self.say(f"Hit the {name}.")
             else:
-                player.take_damage(1, 1, 0)
+                self.say("Swing and a miss.")
+        self.discard.append(self.hand.pop(self.selected))
+        self.draw_card()
+        self.selected = None
+        self.log = []
+        if not self.enemies:
+            self.phase = "clear"
+            self.timer = 35
+            self.say("Round cleared!")
+        else:
+            self.phase = "enemy"
+            self.timer = 22
 
-    for spark in sparks[:]:
-        spark.update()
-        if spark.life <= 0:
-            sparks.remove(spark)
+    # ---------- enemy turn ----------
+    def hurt(self, dmg, who):
+        self.hp -= dmg
+        self.hit_timer = 24
+        self.shake = 10
+        self.spark(self.px, self.py)
+        self.ftext(self.px, self.py, f"-{dmg}", RED)
+        self.log.append(f"{who} -{dmg}!")
 
-    # ── RENDER ───────────────────────────
-    render_offset = [0, 0]
-    if screen_shake > 0:
-        screen_shake -= 1
-        render_offset = [random.randint(-5, 5), random.randint(-5, 5)]
+    def step_toward(self, e, dist):
+        cur = dist[(e.x, e.y)]
+        opts = []
+        for dx, dy in DIRS.values():
+            n = (e.x + dx, e.y + dy)
+            if n in dist and dist[n] < cur and self.free(*n):
+                opts.append(n)
+        if opts:
+            e.x, e.y = random.choice(opts)
+            return True
+        return False
 
-    if render_offset != [0,0]:
-        surface = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
-    else:
-        surface = screen
+    def random_step(self, e):
+        opts = [(e.x + dx, e.y + dy) for dx, dy in DIRS.values() if self.free(e.x + dx, e.y + dy)]
+        if opts:
+            e.x, e.y = random.choice(opts)
 
-    surface.fill(BLACK)
-    draw_grid(surface)
+    def retreat(self, e, dist):
+        cur = dist[(e.x, e.y)]
+        opts = []
+        for dx, dy in DIRS.values():
+            n = (e.x + dx, e.y + dy)
+            if n in dist and dist[n] > cur and self.free(*n):
+                opts.append(n)
+        if opts:
+            e.x, e.y = random.choice(opts)
+            return True
+        return False
 
-    # Draw Entities
-    for enemy in enemies:
-        enemy.draw(surface)
-    player.draw(surface)
-    for spark in sparks:
-        spark.draw(surface)
+    def enemy_act(self, e, dist):
+        k = e.kind
+        d = abs(e.x - self.px) + abs(e.y - self.py)
+        aligned = (e.x == self.px or e.y == self.py)
+        name = ENEMY_TYPES[k]["name"]
 
-    # Draw Health UI
-    for i in range(player.hp):
-        pygame.draw.rect(surface, WHITE, (10 + (i * 20), 10, 15, 15))
-    if player.hp <= 0:
-        # Simple Game Over overlay
-        pygame.draw.rect(surface, (100, 0, 0), (0, SCREEN_HEIGHT//2 - 20, SCREEN_WIDTH, 40))
+        if k == "walker":                    # steady 1 tile/turn, bites when adjacent
+            if d == 1:
+                self.hurt(1, name)
+            else:
+                self.step_toward(e, dist)
 
-    if render_offset != [0,0]:
+        elif k == "bat":                     # fast (2 tiles) but flaky
+            for _ in range(2):
+                if self.adjacent(e):
+                    break
+                if random.random() < 0.25:
+                    self.random_step(e)
+                else:
+                    self.step_toward(e, dist)
+            if self.adjacent(e):
+                self.hurt(1, name)
+
+        elif k == "archer":                  # shoots down straight lines, kites away
+            if aligned and 2 <= d <= 5 and self.line_clear(e.x, e.y, self.px, self.py):
+                self.beam((e.x, e.y), (self.px, self.py), GREEN, 12, 3)
+                self.hurt(1, name)
+            elif d == 1:
+                if not self.retreat(e, dist):
+                    self.hurt(1, name)
+            else:
+                self.step_toward(e, dist)
+
+        elif k == "rook":                    # charges along straight lines
+            if d == 1:
+                self.hurt(2, name)
+            elif aligned and d <= 6 and self.line_clear(e.x, e.y, self.px, self.py):
+                dx, dy = sign(self.px - e.x), sign(self.py - e.y)
+                start = (e.x, e.y)
+                while self.free(e.x + dx, e.y + dy):
+                    e.x += dx
+                    e.y += dy
+                self.beam(start, (e.x, e.y), BLUE, 10, 5)
+                if self.adjacent(e):
+                    self.hurt(2, name + " charge")
+            else:
+                self.step_toward(e, dist)
+
+        elif k == "brute":                   # slow, telegraphs a slam on a tile
+            if e.windup:
+                tx, ty = e.windup
+                e.windup = None
+                self.flashes.append(dict(x=tx, y=ty, color=ORANGE, life=14))
+                if (self.px, self.py) == (tx, ty):
+                    self.hurt(3, name + " slam")
+                else:
+                    self.log.append("Brute missed!")
+            elif d == 1:
+                e.windup = (self.px, self.py)
+                self.log.append("Brute winds up...")
+            else:
+                e.tick += 1
+                if e.tick % 2 == 1:
+                    self.step_toward(e, dist)
+
+    def run_enemies(self):
+        dist = self.bfs((self.px, self.py))
+        for e in list(self.enemies):
+            self.enemy_act(e, dist)
+            if self.hp <= 0:
+                break
+        if self.hp <= 0:
+            self.hp = 0
+            self.state = "dead"
+            self.msg = "You died."
+        else:
+            self.phase = "player"
+            self.msg = self.pmsg + ("   " + " ".join(self.log) if self.log else "")
+
+    # ---------- reward ----------
+    def begin_reward(self):
+        self.max_hp += 1
+        self.hp += 1
+        self.options = [("heal", None)] + [("card", c) for c in random.sample(ALL_CARDS, 3)]
+        self.state = "reward"
+
+    def choose(self, i):
+        kind, val = self.options[i]
+        if kind == "heal":
+            self.hp = min(self.max_hp, self.hp + 3)
+        else:
+            self.deck.append(val)
+        self.round += 1
+        self.state = "play"
+        self.start_round()
+
+    # ---------- input ----------
+    def card_hit(self, i):
+        return pygame.Rect(20 + i * (CARD_W + 10), CARD_Y - 12, CARD_W, CARD_H + 12)
+
+    def reward_rect(self, i):
+        return pygame.Rect(56 + i * 136, 240, 120, 150)
+
+    def mouse_dir(self, pos):
+        if not MAZE_RECT.collidepoint(pos):
+            return None
+        cx, cy = self.center(self.px, self.py)
+        dx, dy = pos[0] - cx, pos[1] - cy
+        if abs(dx) < TILE // 2 and abs(dy) < TILE // 2:
+            return None
+        if abs(dx) > abs(dy):
+            return "RIGHT" if dx > 0 else "LEFT"
+        return "DOWN" if dy > 0 else "UP"
+
+    def handle(self, ev):
+        if ev.type == pygame.QUIT:
+            return False
+        if self.show_help:
+            if ev.type in (pygame.KEYDOWN, pygame.MOUSEBUTTONDOWN):
+                self.show_help = False
+            return True
+        if ev.type == pygame.KEYDOWN:
+            if ev.key == pygame.K_h:
+                self.show_help = True
+                return True
+            if ev.key == pygame.K_ESCAPE:
+                if self.selected is not None:
+                    self.selected = None
+                    return True
+                return False
+            if self.state == "dead" and ev.key == pygame.K_r:
+                self.reset()
+                return True
+
+        if self.state == "reward":
+            if ev.type == pygame.KEYDOWN and pygame.K_1 <= ev.key <= pygame.K_4:
+                self.choose(ev.key - pygame.K_1)
+            elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                for i in range(len(self.options)):
+                    if self.reward_rect(i).collidepoint(ev.pos):
+                        self.choose(i)
+                        break
+        elif self.state == "play" and self.phase == "player":
+            if ev.type == pygame.KEYDOWN:
+                if pygame.K_1 <= ev.key <= pygame.K_5:
+                    i = ev.key - pygame.K_1
+                    if i < len(self.hand):
+                        self.selected = None if self.selected == i else i
+                elif ev.key in KEY_DIR and self.selected is not None:
+                    self.play(KEY_DIR[ev.key])
+            elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                for i in range(len(self.hand)):
+                    if self.card_hit(i).collidepoint(ev.pos):
+                        self.selected = None if self.selected == i else i
+                        return True
+                if self.selected is not None:
+                    d = self.mouse_dir(ev.pos)
+                    if d:
+                        self.play(d)
+        return True
+
+    # ---------- update ----------
+    def update(self):
+        for s in self.sparks[:]:
+            s.update()
+            if s.life <= 0:
+                self.sparks.remove(s)
+        for b in self.beams[:]:
+            b["life"] -= 1
+            if b["life"] <= 0:
+                self.beams.remove(b)
+        for f in self.flashes[:]:
+            f["life"] -= 1
+            if f["life"] <= 0:
+                self.flashes.remove(f)
+        for f in self.floats[:]:
+            f["life"] -= 1
+            f["y"] -= 0.6
+            if f["life"] <= 0:
+                self.floats.remove(f)
+        if self.hit_timer > 0:
+            self.hit_timer -= 1
+
+        if self.state != "play":
+            return
+        if self.phase == "enemy":
+            self.timer -= 1
+            if self.timer <= 0:
+                self.run_enemies()
+        elif self.phase == "clear":
+            self.timer -= 1
+            if self.timer <= 0:
+                self.begin_reward()
+
+    # ---------- drawing ----------
+    def tile_rect(self, x, y):
+        return pygame.Rect(MAZE_X + x * TILE, MAZE_Y + y * TILE, TILE, TILE)
+
+    def tint(self, surf, tiles, color, alpha):
+        ov = pygame.Surface((TILE, TILE), pygame.SRCALPHA)
+        ov.fill((*color, alpha))
+        for (x, y) in tiles:
+            surf.blit(ov, self.tile_rect(x, y).topleft)
+
+    def draw_card_face(self, surf, rect, card, key, selected=False):
+        kind, n = card
+        col = CYAN if kind == "move" else ORANGE
+        pygame.draw.rect(surf, PANEL, rect, border_radius=6)
+        pygame.draw.rect(surf, YELLOW if selected else col, rect, 3 if selected else 2, border_radius=6)
+        draw_text(surf, str(key), FONT_S, GRAY if not selected else YELLOW, topleft=(rect.x + 8, rect.y + 6))
+        draw_text(surf, kind.upper(), FONT_M, col, center=(rect.centerx, rect.y + 24))
+        draw_text(surf, str(n), FONT_L, WHITE, center=(rect.centerx, rect.centery + 2))
+        sub = "tiles" if kind == "move" else f"range - {ATTACK_DMG} dmg"
+        draw_text(surf, sub, FONT_S, (150, 150, 165), center=(rect.centerx, rect.bottom - 14))
+
+    def draw_help(self, surf):
+        ov = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+        ov.fill((0, 0, 0, 215))
+        surf.blit(ov, (0, 0))
+        draw_text(surf, "CARD MAZE", FONT_XL, WHITE, center=(SCREEN_WIDTH // 2, 50))
+        lines = [
+            ("Pick a card (1-5 or click) - it sets the DISTANCE.", WHITE),
+            ("Pick a direction (arrows / WASD, or click the maze).", WHITE),
+            ("One card per turn, then every enemy acts.", WHITE),
+            ("Kill every enemy to clear the round. Each round adds one.", WHITE),
+            ("", WHITE),
+            ("Walker  - walks 1 tile, bites when adjacent", RED),
+            ("Bat     - moves 2 tiles, a bit erratic", PURPLE),
+            ("Archer  - shoots down open lines, backs away", GREEN),
+            ("Rook    - charges along open lines for 2 dmg", BLUE),
+            ("Brute   - slow. Orange tile = slam next turn. MOVE!", ORANGE),
+            ("", WHITE),
+            ("Thin lines show Archer/Rook lanes aimed at you.", (170, 170, 185)),
+            ("After each round: +1 max HP, then heal 3 OR take a card.", (170, 170, 185)),
+            ("", WHITE),
+            ("H = help    ESC = cancel / quit    R = restart (when dead)", (170, 170, 185)),
+            ("Press any key to start", YELLOW),
+        ]
+        y = 100
+        for text, col in lines:
+            draw_text(surf, text, FONT_M, col, center=(SCREEN_WIDTH // 2, y))
+            y += 28
+
+    def draw(self, surf):
+        surf.fill(BLACK)
+
+        # ---- maze ----
+        for y in range(ROWS):
+            for x in range(COLS):
+                r = self.tile_rect(x, y)
+                if self.grid[y][x]:
+                    pygame.draw.rect(surf, WALL, r)
+                    pygame.draw.rect(surf, (40, 40, 52), r, 1)
+                else:
+                    pygame.draw.rect(surf, FLOOR, r)
+                    pygame.draw.rect(surf, GRAY, r, 1)
+
+        # ---- enemy intent: lanes & slam tiles ----
+        for e in self.enemies:
+            aligned = (e.x == self.px or e.y == self.py)
+            d = abs(e.x - self.px) + abs(e.y - self.py)
+            if e.kind == "archer" and aligned and 2 <= d <= 5 and self.line_clear(e.x, e.y, self.px, self.py):
+                pygame.draw.line(surf, GREEN, self.center(e.x, e.y), self.center(self.px, self.py), 1)
+            if e.kind == "rook" and aligned and 2 <= d <= 6 and self.line_clear(e.x, e.y, self.px, self.py):
+                pygame.draw.line(surf, BLUE, self.center(e.x, e.y), self.center(self.px, self.py), 1)
+            if e.windup:
+                self.tint(surf, [e.windup], ORANGE, 120)
+                pygame.draw.rect(surf, ORANGE, self.tile_rect(*e.windup), 2)
+        for f in self.flashes:
+            self.tint(surf, [(f["x"], f["y"])], f["color"], 200)
+
+        # ---- card previews ----
+        if self.selected is not None and self.state == "play" and self.phase == "player":
+            kind, n = self.hand[self.selected]
+            hover = self.mouse_dir(pygame.mouse.get_pos())
+            for d in DIRS:
+                tiles, target = self.ray(d, n, kind)
+                col = CYAN if kind == "move" else YELLOW
+                self.tint(surf, tiles, col, 95 if d == hover else 45)
+                if tiles and kind == "move":
+                    pygame.draw.rect(surf, col, self.tile_rect(*tiles[-1]), 2)
+                if target:
+                    pygame.draw.rect(surf, RED, self.tile_rect(target.x, target.y), 3)
+
+        # ---- enemies ----
+        for e in self.enemies:
+            t = ENEMY_TYPES[e.kind]
+            r = self.tile_rect(e.x, e.y).inflate(-2 * t["inset"], -2 * t["inset"])
+            color = ORANGE if e.windup else t["color"]
+            pygame.draw.rect(surf, color, r)
+            if e.kind == "brute":
+                pygame.draw.rect(surf, BLACK, r, 2)
+            draw_text(surf, t["glyph"], FONT_S, BLACK, center=r.center)
+            bar = pygame.Rect(r.x, r.y - 5, r.w, 3)
+            pygame.draw.rect(surf, GRAY, bar)
+            pygame.draw.rect(surf, WHITE, (bar.x, bar.y, int(bar.w * e.hp / e.max_hp), bar.h))
+
+        # ---- player ----
+        if not (self.hit_timer > 0 and (self.hit_timer // 4) % 2 == 0):
+            pr = self.tile_rect(self.px, self.py).inflate(-6, -6)
+            pygame.draw.rect(surf, WHITE, pr)
+            ex, ey = pr.centerx, pr.centery
+            if self.facing == "RIGHT":
+                ex += 6
+            elif self.facing == "LEFT":
+                ex -= 10
+            elif self.facing == "UP":
+                ey -= 10
+            else:
+                ey += 6
+            pygame.draw.rect(surf, BLACK, (ex - 2, ey - 2, 4, 4))
+
+        # ---- effects ----
+        for b in self.beams:
+            pygame.draw.line(surf, b["color"], b["a"], b["b"], b["width"])
+        for s in self.sparks:
+            s.draw(surf)
+        for f in self.floats:
+            draw_text(surf, f["text"], FONT_M, f["color"], center=(int(f["x"]), int(f["y"])))
+
+        # ---- HUD ----
+        pygame.draw.rect(surf, GRAY, (10, 12, 200, 18))
+        if self.max_hp > 0:
+            pygame.draw.rect(surf, RED, (10, 12, int(200 * max(self.hp, 0) / self.max_hp), 18))
+        draw_text(surf, f"HP {max(self.hp, 0)}/{self.max_hp}", FONT_M, WHITE, center=(110, 21))
+        draw_text(surf, f"Round {self.round}    Enemies {len(self.enemies)}", FONT_M, WHITE, topleft=(440, 14))
+
+        # ---- message bar ----
+        draw_text(surf, self.msg, FONT_M, (210, 210, 225), center=(SCREEN_WIDTH // 2, 472))
+
+        # ---- hand ----
+        for i, card in enumerate(self.hand):
+            sel = (i == self.selected)
+            rect = pygame.Rect(20 + i * (CARD_W + 10), CARD_Y - (12 if sel else 0), CARD_W, CARD_H)
+            self.draw_card_face(surf, rect, card, i + 1, sel)
+        if self.selected is not None:
+            hint = "Pick a direction: arrows / WASD / click the maze"
+        else:
+            hint = "Pick a card: 1-5 or click"
+        draw_text(surf, f"{hint}      Draw {len(self.draw_pile)}  Discard {len(self.discard)}",
+                  FONT_S, (150, 150, 165), center=(SCREEN_WIDTH // 2, 630))
+
+        # ---- reward overlay ----
+        if self.state == "reward":
+            ov = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+            ov.fill((0, 0, 0, 200))
+            surf.blit(ov, (0, 0))
+            draw_text(surf, f"ROUND {self.round} CLEARED", FONT_XL, WHITE, center=(SCREEN_WIDTH // 2, 150))
+            draw_text(surf, "+1 max HP    -    heal 3, or take a card", FONT_M, YELLOW, center=(SCREEN_WIDTH // 2, 195))
+            for i, (kind, val) in enumerate(self.options):
+                r = self.reward_rect(i)
+                if kind == "heal":
+                    pygame.draw.rect(surf, PANEL, r, border_radius=6)
+                    pygame.draw.rect(surf, GREEN, r, 2, border_radius=6)
+                    draw_text(surf, str(i + 1), FONT_S, GRAY, topleft=(r.x + 8, r.y + 6))
+                    draw_text(surf, "HEAL", FONT_M, GREEN, center=(r.centerx, r.y + 24))
+                    draw_text(surf, "+3", FONT_L, WHITE, center=(r.centerx, r.centery + 2))
+                    draw_text(surf, f"HP ({self.hp}/{self.max_hp})", FONT_S, (150, 150, 165),
+                              center=(r.centerx, r.bottom - 14))
+                else:
+                    self.draw_card_face(surf, r, val, i + 1)
+
+        # ---- death overlay ----
+        if self.state == "dead":
+            pygame.draw.rect(surf, (100, 0, 0), (0, SCREEN_HEIGHT // 2 - 50, SCREEN_WIDTH, 100))
+            draw_text(surf, "YOU DIED", FONT_XL, WHITE, center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 - 15))
+            draw_text(surf, f"Reached round {self.round}  -  press R to restart", FONT_M, WHITE,
+                      center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 + 25))
+
+        if self.show_help:
+            self.draw_help(surf)
+
+
+# ─────────────────────────────────────────
+# GAME LOOP
+# ─────────────────────────────────────────
+def main():
+    game = Game()
+    canvas = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
+    running = True
+    while running:
+        for event in pygame.event.get():
+            if not game.handle(event):
+                running = False
+
+        game.update()
+        game.draw(canvas)
+
+        offset = (0, 0)
+        if game.shake > 0:
+            game.shake -= 1
+            offset = (random.randint(-5, 5), random.randint(-5, 5))
         screen.fill(BLACK)
-        screen.blit(surface, render_offset)
+        screen.blit(canvas, offset)
+        pygame.display.flip()
+        clock.tick(FPS)
 
-    if flash_frames > 0:
-        flash_frames -= 1
-        screen.fill(WHITE)
+    pygame.quit()
+    sys.exit()
 
-    pygame.display.flip()
-    clock.tick(FPS)
 
-pygame.quit()
-sys.exit()
+if __name__ == "__main__":
+    main()
